@@ -51,169 +51,140 @@ private:
 
 };
 
+//template<typename T>
+//class LockFreeStack
+//{
+//	struct Node
+//	{
+//		Node(const T& value) : data(make_shared<T>(value)), next(nullptr)
+//		{
+//		}
+//		
+//		shared_ptr<T> data;
+//		shared_ptr<Node> next;
+//	};
+//
+//public:
+//
+//	void Push(const T& value)
+//	{
+//		shared_ptr<Node> node = make_shared<Node>(value);
+//		node->next = atomic_load(&_head);
+//
+//		while(atomic_compare_exchange_weak(&_head, &node->next, node) == false)
+//		{
+//		}
+//	}
+//
+//	shared_ptr<T> TryPop()
+//	{
+//		shared_ptr<Node> oldHead = atomic_load(&_head);
+//
+//		while (oldHead && atomic_compare_exchange_weak(&_head, &oldHead, oldHead->next) == false)
+//		{
+//		}
+//
+//		if (oldHead == nullptr)
+//			return shared_ptr<T>();
+//
+//		return oldHead->data;
+//	}
+//
+//private:
+//	shared_ptr<Node> _head;
+//
+//};
+
 template<typename T>
 class LockFreeStack
 {
+	struct Node;
+	struct CountedNodePtr
+	{
+		int32 externalCount = 0;
+		Node* ptr = nullptr;
+	};
+
 	struct Node
 	{
-		Node(const T& value) : data(value), next(nullptr) 
+		Node(const T& value) : data(make_shared<T>(value))
 		{
-
 		}
 
-		T data;
-		Node* next;
+		shared_ptr<T> data;
+		atomic<int32> intenalCount = 0;
+		CountedNodePtr next;
 	};
 
 public:
-	// 1) 새 노드를 만들고
-	// 2) 새 노드의 next = head
-	// 3) head = 새 노드
 
-	// [][][][][][]
-	// [head]
 	void Push(const T& value)
 	{
-		Node* node = new Node(value);
-		node->next = _head;
-
-		/*if (_head == node->next)
+		CountedNodePtr node;
+		node.ptr = new Node(value);
+		node.externalCount = 1;
+		node.ptr->next = _head;
+		while (_head.compare_exchange_weak(node.ptr->next, node) == false)
 		{
-			_head = node;
-			return true;
 		}
-		else
-		{
-			node->next = _head;
-			return false;
-		}*/
-
-		while (_head.compare_exchange_weak(node->next, node) == false)
-		{
-			//node->next = _head;
-		}
-
-		// 이 사이에 새치기 당하면?
-		//_head = node;
 	}
 
-	// 1) head 읽기
-	// 2) head->next 읽기
-	// 3) head = head->next
-	// 4) data 추출해서 반환
-	// 5) 추출한 노드를 삭제
-
-	// [][][][][][]
-	// [head]
-	bool TryPop(T& value)
+	shared_ptr<T> TryPop()
 	{
-
-		++_popCount;
-		Node* oldHead = _head;
-
-		/*if (_head == oldHead)
+		CountedNodePtr oldHead = _head;
+		while (true)
 		{
-			_head = oldHead->next;
-			return true;
-		}
-		else
-		{
-			oldHead = _head;
-			return false;
-		}*/
+			// 참조권 획득 (externalCount를 현 시점 기준 +1 한 애가 이김)
+			IncreaseheadCount(oldHead);
+			// 최소한 externalCount >= 2 일테니 삭제X (안전하게 접근할 수 있는)
+			Node* ptr = oldHead.ptr;
 
-		while (oldHead && _head.compare_exchange_weak(oldHead, oldHead->next) == false)
-		{
-			// oldHead = _head;
-		}
+			// 데이터 없음
+			if (ptr == nullptr)
+				return shared_ptr<T>();
 
-		if (oldHead == nullptr)
-		{
-			--_popCount;
-			return false;
-		}
-
-		value = oldHead->data;
-		//delete oldHead;
-		TryDelete(oldHead);
-		return true;
-	}
-
-	// 1) 데이터 분리
-	// 2) Count 체크
-	// 3) 나 혼자면 삭제
-	void TryDelete(Node* oldHead)
-	{
-		// 나 외에 누가 있는가?
-		if (_popCount == 1)
-		{
-			// 나 혼자네?
-
-			// 이왕 혼자인거, 삭제 예약된 다른 데이터들도 삭제해보자
-			Node* node = _pendingList.exchange(nullptr);
-
-			if (--_popCount == 0)
+			// 소유권 획득 (ptr->next로 head를 바꿔치기 한 애가 이김)
+			if (_head.compare_exchange_strong(oldHead, ptr->next))
 			{
-				// 끼어든 애가 없음 -> 삭제 진행
-				// 이제와서 끼어들어고, 어차피 데이터는 분리해둔 상태
-				DeleteNodes(node);
+				shared_ptr<T> res;
+				res.swap(ptr->data);
+
+				// external : 1 -> 2(+1) ->4(나+1 남+2)
+				// internal : 0 -> 2 -> 1 -> 0
+
+				// 나 말고 또 누가 있는가?
+				const int32 countIncrease = oldHead.externalCount - 2;
+
+				if (ptr->intenalCount.fetch_add(countIncrease) == -countIncrease)
+					delete ptr;
+
+				return res;
 			}
-			else if (node)
+			else if (ptr->intenalCount.fetch_sub(1) == 1)
 			{
-				// 누가 끼어들었으니 다시 갖다 놓자
-				ChainPendingNodeList(node);
+				// 참조권은 얻었으나, 소유권은 실패 -> 뒷 수습은 내가 한다.
+				delete ptr;
 			}
-
-			// 내 데이터는 삭제
-			delete oldHead;
 		}
-		else
+
+	}
+private:
+	void IncreaseheadCount(CountedNodePtr& oldCounter)
+	{
+		while (true)
 		{
-			// 누가 있네? 그럼 지금 삭제하지 않고, 삭제 예약만
-			ChainPendingNode(oldHead);
-			--_popCount;
-		}
-	}
+			CountedNodePtr newCounter = oldCounter;
+			newCounter.externalCount++;
 
-	void ChainPendingNodeList(Node* first, Node* last)
-	{
-		last->next = _pendingList;
-
-		while (_pendingList.compare_exchange_weak(last->next, first) == false)
-		{
-		}
-	}
-
-	void ChainPendingNodeList(Node* node)
-	{
-		Node* last = node;
-		while (last->next)
-			last = last->next;
-
-		ChainPendingNodeList(node, last);
-	}
-
-	void ChainPendingNode(Node* node)
-	{
-		ChainPendingNodeList(node, node);
-	}
-
-	static void DeleteNodes(Node* node)
-	{
-		while (node)
-		{
-			Node* next = node->next;
-			delete node;
-			node = next;
+			if (_head.compare_exchange_strong(oldCounter, newCounter))
+			{
+				oldCounter.externalCount = newCounter.externalCount;
+				break;
+			}
 		}
 	}
 
 private:
-	// [][][][][][]
-	// [head]
-	atomic<Node*> _head;
+	atomic<CountedNodePtr> _head;
 
-	atomic<uint32> _popCount = 0; // Pop을 실행중인 쓰레드 개수
-	atomic<Node*> _pendingList; // 삭제 되어야 할 노드들 (첫번째 노드)
 };
-
